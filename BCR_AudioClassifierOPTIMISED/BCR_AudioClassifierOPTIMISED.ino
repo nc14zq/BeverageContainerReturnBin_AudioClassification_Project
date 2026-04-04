@@ -9,7 +9,7 @@
 #include "tensorflow/lite/version.h"
 #include "arduinoFFT.h"
 #include <Arduino_LSM9DS1.h>
-#include "/Users/nc/NTU/BCR_AudioProject/headerfiles/fft_bcr_float32.h"
+#include "fft_bcr_float32.h"
 
 ///////////////////////////////////////////////////////// AUDIO SETUP
 constexpr uint32_t SAMPLE_RATE = 16000;
@@ -17,6 +17,8 @@ constexpr uint16_t FFT_SIZE    = 4096;
 constexpr uint8_t  CHANNELS    = 1;
 
 constexpr float PEAK_THRESHOLD = 0.15f;
+
+constexpr uint16_t PRE_TRIGGER_SAMPLES = 2400;
 
 ///////////////////////////////////////////////////////// IMU SETUP
 constexpr float IMU_THRESHOLD_G = 1.05f;
@@ -55,6 +57,10 @@ volatile bool captureAudio = false;
 double vReal[FFT_SIZE];
 double vImag[FFT_SIZE];
 
+float preTriggerBuffer[PRE_TRIGGER_SAMPLES];
+volatile uint16_t preTriggerWriteIndex = 0;
+volatile bool preTriggerFilled = false;
+
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, FFT_SIZE, SAMPLE_RATE);
 
 ///////////////////////////////////////////////////////// SCALER SETUP
@@ -73,7 +79,7 @@ const float scale_vals[4] = {
 };
 
 ///////////////////////////////////////////////////////// TFLM
-constexpr int kTensorArenaSize = 12 * 1024;
+constexpr int kTensorArenaSize = 3 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
 
 const tflite::Model* model = nullptr;
@@ -97,6 +103,39 @@ void normalizeAudio(float* buf, int n) {
 
   for (int i = 0; i < n; i++) {
     buf[i] /= peak;
+  }
+}
+
+void resetPreTriggerBuffer() {
+  noInterrupts();
+  preTriggerWriteIndex = 0;
+  preTriggerFilled = false;
+  interrupts();
+
+  for (int i = 0; i < PRE_TRIGGER_SAMPLES; i++) {
+    preTriggerBuffer[i] = 0.0f;
+  }
+}
+
+void copyPreTriggerToAudioFrame() {
+  uint16_t startIdx = preTriggerFilled ? preTriggerWriteIndex : 0;
+  uint16_t available = preTriggerFilled ? PRE_TRIGGER_SAMPLES : preTriggerWriteIndex;
+  uint16_t padCount = PRE_TRIGGER_SAMPLES - available;
+  uint16_t outIdx = 0;
+
+  for (uint16_t i = 0; i < padCount; i++) {
+    audioFrame[outIdx++] = 0.0f;
+  }
+
+  if (preTriggerFilled) {
+    for (uint16_t i = 0; i < PRE_TRIGGER_SAMPLES; i++) {
+      uint16_t idx = (startIdx + i) % PRE_TRIGGER_SAMPLES;
+      audioFrame[outIdx++] = preTriggerBuffer[idx];
+    }
+  } else {
+    for (uint16_t i = 0; i < available; i++) {
+      audioFrame[outIdx++] = preTriggerBuffer[i];
+    }
   }
 }
 
@@ -198,14 +237,12 @@ bool runInference(const float scaled_features[4], float& prob) {
   TfLiteStatus status = interpreter->Invoke();
 
   if (status != kTfLiteOk) {
-    Serial.println("Invoke failed");
     return false;
   }
 
   if (output->type == kTfLiteFloat32) {
     prob = output->data.f[0];
   } else {
-    Serial.println("Unsupported output type");
     return false;
   }
 
@@ -237,19 +274,29 @@ void onPDMdata() {
 
   PDM.read(pdmBuffer, bytesAvailable);
 
-  if (!captureAudio) return;
-
   int sampleCount = bytesAvailable / 2;
 
   for (int i = 0; i < sampleCount; i++) {
-    if (audioIndex < FFT_SIZE) {
-      audioFrame[audioIndex++] = (float)pdmBuffer[i] / 32768.0f;
+    float sample = (float)pdmBuffer[i] / 32768.0f;
+
+    preTriggerBuffer[preTriggerWriteIndex] = sample;
+    preTriggerWriteIndex++;
+
+    if (preTriggerWriteIndex >= PRE_TRIGGER_SAMPLES) {
+      preTriggerWriteIndex = 0;
+      preTriggerFilled = true;
     }
 
-    if (audioIndex >= FFT_SIZE) {
-      frameReady = true;
-      captureAudio = false;
-      break;
+    if (captureAudio) {
+      if (audioIndex < FFT_SIZE) {
+        audioFrame[audioIndex++] = sample;
+      }
+
+      if (audioIndex >= FFT_SIZE) {
+        frameReady = true;
+        captureAudio = false;
+        break;
+      }
     }
   }
 }
@@ -278,7 +325,8 @@ void checkIMUTriggerLowRate() {
     systemArmed = false;
 
     noInterrupts();
-    audioIndex = 0;
+    copyPreTriggerToAudioFrame();
+    audioIndex = PRE_TRIGGER_SAMPLES;
     frameReady = false;
     captureAudio = true;
     interrupts();
@@ -320,7 +368,6 @@ void setup() {
   while (!Serial) {}
 
   if (!IMU.begin()) {
-    Serial.println("IMU init failed");
     while (1);
   }
 
@@ -332,7 +379,6 @@ void setup() {
 
   model = tflite::GetModel(fft_bcr_float32_tflite);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("Model schema mismatch");
     while (1);
   }
 
@@ -346,7 +392,6 @@ void setup() {
   interpreter = &static_interpreter;
 
   if (interpreter->AllocateTensors() != kTfLiteOk) {
-    Serial.println("AllocateTensors failed");
     while (1);
   }
 
@@ -357,16 +402,15 @@ void setup() {
   PDM.setGain(30);
 
   if (!PDM.begin(CHANNELS, SAMPLE_RATE)) {
-    Serial.println("PDM.begin() failed");
     while (1);
   }
 
   resetAudioFrame();
+  resetPreTriggerBuffer();
 }
 
-// =====================
-// LOOP
-// =====================
+///////////////////////////////////////////////////////// LOOP
+
 void loop() {
   checkIMUTriggerLowRate();
 
