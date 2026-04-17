@@ -5,8 +5,6 @@ This project was developed as a small-scale prototype inspired by Singapore’s 
 
 The system classifies whether an inserted beverage container is a **plastic bottle** or an **aluminium can** using **audio-based machine learning** on an embedded device, then actuates a servo motor to sort it into the correct bin.
 
-This report documents the full development journey, from initial ideation to final implementation, including the challenges encountered throughout the project.
-
 ## Demonstration
 A short 1-minute demonstration of the smart BCR bin can be viewed here:
 
@@ -35,4 +33,4 @@ This demonstrates how embedded machine learning can be applied to edge-based rec
 6. Servo motor sorts the container into the correct bin
 
 ## Notes
-More implementation details, model development steps and system challenges are documented in the full report.
+The full report documents the development journey, from initial ideation to final implementation, including the challenges encountered throughout the project.
